@@ -1,12 +1,19 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dateutil import parser
-import re
+from google import genai
+from dotenv import load_dotenv
+import os
+import json
+
+load_dotenv()
+
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
 
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,84 +22,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def extract_value(pattern, text):
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def clean_amount(value):
-    if value is None:
-        return None
-
-    value = value.replace(",", "")
-    value = re.sub(r"Rs\.?|INR", "", value, flags=re.IGNORECASE).strip()
-
-    try:
-        return float(value)
-    except:
-        return None
-
-
 @app.get("/")
-def root():
+def home():
     return {"status": "API Running"}
 
 
 @app.post("/extract")
-def extract_invoice(req: InvoiceRequest):
+def extract(req: InvoiceRequest):
+    try:
 
-    text = req.invoice_text
+        prompt = f"""
+You are an invoice extraction assistant.
 
-    invoice_no = extract_value(
-        r"Invoice\s*(?:No|Number)?\s*[:#]?\s*([A-Za-z0-9\-\/]+)",
-        text,
-    )
+Extract the following fields from the invoice text.
 
-    vendor = extract_value(
-        r"Vendor\s*[:]\s*(.+)",
-        text,
-    )
+Return ONLY valid JSON.
 
-    date_str = extract_value(
-        r"Date\s*[:]\s*(.+)",
-        text,
-    )
+Required JSON schema:
 
-    subtotal = extract_value(
-        r"(?:Subtotal|Sub Total)\s*[:]\s*(.+)",
-        text,
-    )
+{{
+    "invoice_no": null,
+    "date": null,
+    "vendor": null,
+    "amount": null,
+    "tax": null,
+    "currency": null
+}}
 
-    tax = extract_value(
-        r"(?:GST|Tax|VAT).*?[:]\s*(.+)",
-        text,
-    )
+Rules:
 
-    currency = None
+1. Always return ALL six keys.
+2. Use null if a value is missing.
+3. date must be ISO format YYYY-MM-DD.
+4. amount is the subtotal BEFORE tax.
+5. tax is ONLY the tax amount.
+6. Currency should be:
+   - INR for Rs./INR
+   - USD for $
+   - EUR for €
+   - GBP for £
+7. amount and tax must be numbers.
+8. Return ONLY JSON.
+9. No markdown.
+10. No explanation.
 
-    if re.search(r"Rs\.?|INR", text, re.IGNORECASE):
-        currency = "INR"
+Invoice:
 
-    iso_date = None
+{req.invoice_text}
+"""
 
-    if date_str:
-        try:
-            iso_date = parser.parse(date_str).date().isoformat()
-        except:
-            iso_date = None
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt
+        )
 
-    return {
-        "invoice_no": invoice_no,
-        "date": iso_date,
-        "vendor": vendor,
-        "amount": clean_amount(subtotal),
-        "tax": clean_amount(tax),
-        "currency": currency,
-    }
+        answer = response.text.strip()
+
+        answer = answer.replace("```json", "")
+        answer = answer.replace("```", "")
+        answer = answer.strip()
+
+        data = json.loads(answer)
+
+        result = {
+            "invoice_no": data.get("invoice_no"),
+            "date": data.get("date"),
+            "vendor": data.get("vendor"),
+            "amount": data.get("amount"),
+            "tax": data.get("tax"),
+            "currency": data.get("currency")
+        }
+
+        return result
+
+    except Exception as e:
+        return {
+            "invoice_no": None,
+            "date": None,
+            "vendor": None,
+            "amount": None,
+            "tax": None,
+            "currency": None,
+            "error": str(e)
+        }
